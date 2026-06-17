@@ -3263,13 +3263,18 @@ torch::Tensor moe_gemm_int4_nmajor(
         fp16* out = (fp16*)output.data_ptr();
         const int* eidx = (const int*)expert_idx.data_ptr();
 
-        cgh.parallel_for(
+        cgh.parallel_for<class MoeInt4NMajorGemmEsimd>(  // PATCH(kai): was unnamed (only 1 of 38); names required under -fsycl-host-compiler
             sycl::range<2>(E, N / N_TILE),
             [=](sycl::id<2> id) SYCL_ESIMD_KERNEL {
                 constexpr int MS = MAX_M / 16;
                 constexpr int NS = N_TILE / 8;
                 constexpr int ACC_SZ = MS * NS * 128;
-                constexpr int KP_PER_GROUP = BS / 8;
+                // PATCH(kai): derive packed-int32 per group from the runtime
+                // group_size (was hardcoded BS/8 = 16 -> group=128 only). The kg
+                // loop already strides by K_groups = K/group_size, so making
+                // KP_PER_GROUP = group_size/8 makes group=32 (and any multiple of
+                // 16 K-elements) work without touching the K-traversal structure.
+                const int KP_PER_GROUP = (int)group_size / 8;
 
                 const int eid = (int)id[0];
                 const int tid = (int)id[1];
