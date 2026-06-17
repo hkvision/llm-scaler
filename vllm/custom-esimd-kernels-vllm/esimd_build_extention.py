@@ -284,7 +284,11 @@ COMMON_HIPCC_FLAGS = [
 
 _COMMON_SYCL_FLAGS = [
     '-fsycl',
-    '-fsycl-targets=spir64_gen,spir64',
+    # PATCH(kai / build-esimd-kernels skill): B390 = PTL/XE3 (XeLPG, no dpas2).
+    # The stock AOT target `spir64_gen` needs a `-Xs "-device <archlist>"` that
+    # clang-offload-bundler rejects here ("'mtl,...,ptl': no such file"). PTL must
+    # use pure JIT SPIR-V (skill: "JIT SYCL, no -device flag"); it JITs at runtime.
+    '-fsycl-targets=spir64',
 ]
 
 def _get_sycl_arch_list():
@@ -301,7 +305,9 @@ _SYCL_DLINK_FLAGS = [
     *_COMMON_SYCL_FLAGS,
     '-fsycl-link',
     '--offload-compress',
-    f'-Xs "-device {_get_sycl_arch_list()}"',
+    # No `-Xs "-device ..."`: that is an AOT (spir64_gen) backend option. With
+    # pure JIT spir64 there is no AOT backend at link time and the device-arch
+    # list ("mtl,...,ptl") is rejected by clang-offload-bundler. See PATCH above.
 ]
 
 # JIT_EXTENSION_VERSIONER = ExtensionVersioner()
@@ -983,6 +989,43 @@ class BuildExtension(build_ext):
             else:
                 cuda_dlink_post_cflags = None
 
+            # PATCH(kai / build-esimd-kernels skill Bug 2): the Windows path was
+            # missing SYCL support, so .sycl files fell through to the cl compile
+            # rule ("unrecognized source file type" -> LNK1181). Detect sycl
+            # sources and build sycl flags (mirror unix_wrap_ninja_compile) so
+            # _write_ninja_file emits a sycl_compile rule using $sycl (icx) — and
+            # crucially WITHOUT -fsycl-host-compiler (torch's stock path adds that,
+            # which mixes MSVC + clang intrinsic headers and breaks on VS 14.44).
+            with_sycl = any(map(_is_sycl_file, sources))
+            sycl_cflags = sycl_post_cflags = sycl_dlink_post_cflags = None
+            if with_sycl:
+                sycl_cflags = list(_COMMON_SYCL_FLAGS) + common_cflags + pp_opts
+                # PATCH(kai / build-esimd-kernels skill): distutils MSVCCompiler
+                # injects the MSVC VC-Tools and Windows-SDK include dirs as plain
+                # `-I` (high priority). On VS 14.44 / oneAPI clang-21 that puts
+                # MSVC's immintrin.h AHEAD of clang's builtin intrinsic headers,
+                # so MSVC's SVML decls (`_mm_div_epi8`, ...) collide with clang's
+                # SVML *builtins* -> "conflicting types for '_mm_div_epi8'".
+                # Demote those system dirs to `-imsvc` (clang MSVC-system include,
+                # searched after the builtin headers) -> conflict disappears.
+                # No system-header patching needed. Proven: -I fails, -imsvc passes.
+                def _to_imsvc(flag):
+                    if flag.startswith('-I') and (
+                        'Microsoft Visual Studio' in flag or 'Windows Kits' in flag):
+                        return '-imsvc' + flag[2:]
+                    return flag
+                sycl_cflags = [_to_imsvc(f) for f in sycl_cflags]
+                if isinstance(extra_postargs, dict) and 'sycl' in extra_postargs:
+                    sycl_post_cflags = list(extra_postargs['sycl'])
+                else:
+                    sycl_post_cflags = list(extra_postargs) if extra_postargs else []
+                append_std17_if_no_std_present(sycl_cflags)
+                _append_sycl_std_if_no_std_present(sycl_cflags)
+                sycl_dlink_post_cflags = list(_SYCL_DLINK_FLAGS)
+                sycl_cflags = _nt_quote_args(sycl_cflags)
+                sycl_post_cflags = _nt_quote_args(sycl_post_cflags)
+                sycl_dlink_post_cflags = _nt_quote_args(sycl_dlink_post_cflags)
+
             _write_ninja_file_and_compile_objects(
                 sources=sources,
                 objects=objects,
@@ -991,13 +1034,13 @@ class BuildExtension(build_ext):
                 cuda_cflags=cuda_cflags,
                 cuda_post_cflags=cuda_post_cflags,
                 cuda_dlink_post_cflags=cuda_dlink_post_cflags,
-                sycl_cflags=None,
-                sycl_post_cflags=None,
-                sycl_dlink_post_cflags=None,
+                sycl_cflags=sycl_cflags,
+                sycl_post_cflags=sycl_post_cflags,
+                sycl_dlink_post_cflags=sycl_dlink_post_cflags,
                 build_directory=output_dir,
                 verbose=True,
                 with_cuda=with_cuda,
-                with_sycl=False)
+                with_sycl=with_sycl)
 
             # Return *all* object filenames, not just the ones we just built.
             return objects
@@ -2851,7 +2894,16 @@ e.
         sycl_devlink_out = os.path.join(os.path.dirname(objects[0]), 'sycl_dlink.o')
         sycl_devlink_rule = ['rule sycl_devlink']
         sycl_devlink_rule.append('  command = $sycl $in -o $out $sycl_dlink_post_cflags')
-        sycl_devlink = [f'build {sycl_devlink_out}: sycl_devlink {" ".join(objects)}']
+        # PATCH(kai / build-esimd-kernels skill Bug 3): escape Windows drive
+        # colons in the sycl_devlink build line ("C:" -> "C$:"), else ninja errors
+        # "expected build command name". (The compile build line is already escaped.)
+        if IS_WINDOWS:
+            _dl_out = sycl_devlink_out.replace(':', '$:').replace(' ', '$ ')
+            _dl_ins = [o.replace(':', '$:').replace(' ', '$ ') for o in objects]
+        else:
+            _dl_out = sycl_devlink_out.replace(' ', '$ ')
+            _dl_ins = [o.replace(' ', '$ ') for o in objects]
+        sycl_devlink = [f'build {_dl_out}: sycl_devlink {" ".join(_dl_ins)}']
         objects += [sycl_devlink_out]
     else:
         sycl_devlink_rule, sycl_devlink = [], []
